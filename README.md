@@ -24,16 +24,5 @@ Commands run:
 5. Stop the script (Ctrl+C) to trigger ARP restore.
 6. Stop tcpdump (Ctrl+C).
 
-## Script features
-- Command-line args: `-t/--target`, `-g/--gateway`, `-i/--iface`, `-f/--frequency` (default 2s).
-- Verbose output: prints resolved MACs and sent packet counter.
-- Graceful restore on exit: script sends ARP restore packets on SIGINT.
-- IP forwarding: **manual** via `sysctl` (see step 2) — NOTE: if `--enable-ipfwd` flag is not present in this version, forwarding was toggled manually and evidence is included.
-
 ## Evidence included
 See `evidence/` for screenshots and `pcap_files/attacker_capture.pcap` for full packet capture. Wireshark screenshots show ARP replies advertising attacker's MAC for both 10.0.0.1 and 10.0.0.2, plus IP packets between victim and gateway observed on attacker (MitM).
-
-## Dependencies
-See `requirements.txt`. Install with:
-`sudo pip3 install -r requirements.txt`
-
