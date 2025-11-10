@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
 """
 traffic_interceptor.py
-
-Usage:
-    python3 traffic_interceptor.py capture.pcap
-
-Produces (in ./outputs/):
-    - urls.csv            : timestamp, src_ip, dst_ip, http_method, host, path
-    - dns_queries.csv     : timestamp, src_ip, qname, qtype
-    - top_talkers.csv     : ip, packets, bytes
-    - protocol_counts.csv : protocol, packets
-
-Notes:
-- Extracts HTTP URLs by scanning TCP payloads for "GET"/"POST" and "Host:".
-- DNS queries are extracted from DNS layer if present (Scapy).
-- HTTPS/TLS is encrypted: script cannot extract full HTTP URLs for TLS flows (only SNI if present in clear, but SNI parsing not included here).
-- Requires scapy installed (pip3 install scapy).
 """
 import sys
 import os
@@ -70,11 +55,11 @@ def main(pcap_path):
     packets = rdpcap(pcap_path)
 
     # Outputs
-    os.makedirs('outputs', exist_ok=True)
-    urls_file = open('outputs/urls.csv', 'w', newline='', encoding='utf-8')
-    dns_file = open('outputs/dns_queries.csv', 'w', newline='', encoding='utf-8')
-    talkers_file = open('outputs/top_talkers.csv', 'w', newline='', encoding='utf-8')
-    proto_file = open('outputs/protocol_counts.csv', 'w', newline='', encoding='utf-8')
+    os.makedirs('evidence', exist_ok=True)
+    urls_file = open('evidence/urls.csv', 'w', newline='', encoding='utf-8')
+    dns_file = open('evidence/dns_queries.csv', 'w', newline='', encoding='utf-8')
+    talkers_file = open('evidence/top_talkers.csv', 'w', newline='', encoding='utf-8')
+    proto_file = open('evidence/protocol_counts.csv', 'w', newline='', encoding='utf-8')
 
     url_writer = csv.writer(urls_file)
     url_writer.writerow(['timestamp','src_ip','dst_ip','method','host','path'])
@@ -149,7 +134,7 @@ def main(pcap_path):
     dns_file.close()
     talkers_file.close()
     proto_file.close()
-    print("Done. Outputs written to ./outputs/")
+    print("Done. Outputs written to evidence/")
     print(f"HTTP entries: {http_seen}, DNS entries: {dns_seen}")
 
 if __name__ == '__main__':
