@@ -1,0 +1,7 @@
+protocol,packets
+DNS,1598
+TCP,732
+ARP,246
+HTTP,22
+UDP,3
+OTHER,1
